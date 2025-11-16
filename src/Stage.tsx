@@ -27,12 +27,14 @@ interface SaveState {
     stats: {[stat in Stat]: number};
     lastOutcome: Outcome|null;
     lastOutcomePrompt: string;
+    companionExperience?: number;
 }
 
 export class Stage extends StageBase<InitStateType, ChatStateType, MessageStateType, ConfigType> {
     
     readonly defaultStat: number = 0;
     readonly levelThresholds: number[] = [2, 5, 8, 12, 16, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100];
+    readonly companionThresholds: number[] = [5, 15, 30, 50, 80, 120, 170, 230, 300];
 
     // message-level variables
     userState: {[key: string]: SaveState} = {};
@@ -79,6 +81,8 @@ export class Stage extends StageBase<InitStateType, ChatStateType, MessageStateT
             stats: this.clearStatMap(),
             lastOutcome: null,
             lastOutcomePrompt: ''
+            ,
+            companionExperience: 0
         }
     }
 
@@ -222,6 +226,15 @@ export class Stage extends StageBase<InitStateType, ChatStateType, MessageStateT
                     finalContent += `\n###${this.users[anonymizedId].name} has learned from this experience...###`
                 }
             }
+
+            // Companion XP: award on successful enemy defeats when using physical stats (Might, Grace, Skill)
+            const outcomeResult = this.getUserState(anonymizedId).lastOutcome?.result ?? Result.None;
+            const isPhysicalStat = takenAction?.stat && [Stat.Might, Stat.Grace, Stat.Skill].includes(takenAction.stat);
+            if (isPhysicalStat && [Result.CompleteSuccess, Result.CriticalSuccess].includes(outcomeResult)) {
+                const xpGain = outcomeResult === Result.CriticalSuccess ? 12 : 6;
+                this.awardCompanionXP(anonymizedId, xpGain);
+                finalContent += `\n###Companion gained ${xpGain} XP!###`;
+            }
         }
 
         return {
@@ -241,6 +254,33 @@ export class Stage extends StageBase<InitStateType, ChatStateType, MessageStateT
         return Object.values(this.getUserState(anonymizedId).stats).reduce((acc, val) => acc + val, 0)
     }
 
+    getCompanionLevel(anonymizedId: string): number {
+        const xp = this.getUserState(anonymizedId).companionExperience ?? 0;
+        let level = 0;
+        for (let i = 0; i < this.companionThresholds.length; i++) {
+            if (xp >= this.companionThresholds[i]) level = i + 1;
+            else break;
+        }
+        return level;
+    }
+
+    awardCompanionXP(anonymizedId: string, xp: number) {
+        const state = this.getUserState(anonymizedId);
+        state.companionExperience = (state.companionExperience ?? 0) + xp;
+        // If companion exactly hit a threshold, grant a small bonus to a favored stat
+        if (this.companionThresholds.includes(state.companionExperience ?? 0)) {
+            const statUseValues = Object.values(state.statUses);
+            if (statUseValues.length > 0) {
+                const maxCount = Math.max(...statUseValues);
+                const maxStats = Object.keys(state.statUses)
+                        .filter((stat) => state.statUses[stat as Stat] === maxCount)
+                        .map((stat) => stat as Stat);
+                let chosenStat = maxStats.length > 0 ? maxStats[Math.floor(Math.random() * maxStats.length)] : Stat.Might;
+                state.stats[chosenStat]++;
+            }
+        }
+    }
+
     async afterResponse(botMessage: Message): Promise<Partial<StageResponse<ChatStateType, MessageStateType>>> {
 
         let message = botMessage.content;
@@ -254,9 +294,21 @@ export class Stage extends StageBase<InitStateType, ChatStateType, MessageStateT
             modifiedMessage: botMessage.content.split(/---|\*\*\*|```/)[0].trim(),
             error: null,
             systemMessage: '---\n```' +
-                Object.values(this.users).map(user =>
-                `${user.name} - Level ${this.getLevel(user.anonymizedId) + 1} (${this.getUserState(user.anonymizedId).experience}/${this.levelThresholds[this.getLevel(user.anonymizedId)]})\n` +
-                `${Object.keys(Stat).map(key => `${key}: ${this.getUserState(user.anonymizedId).stats[key as Stat]}`).join(' | ')}`).join('\n') +
+                Object.values(this.users).map(user => {
+                    const companionLevel = this.getCompanionLevel(user.anonymizedId);
+                    const companionXP = this.getUserState(user.anonymizedId).companionExperience ?? 0;
+                    const companionNextThreshold = this.companionThresholds[companionLevel] ?? this.companionThresholds[this.companionThresholds.length - 1];
+                    const companionPrevThreshold = companionLevel > 0 ? this.companionThresholds[companionLevel - 1] : 0;
+                    const companionXPProgress = companionXP - companionPrevThreshold;
+                    const companionXPTotal = companionNextThreshold - companionPrevThreshold;
+                    const companionBarLength = 10;
+                    const companionFill = Math.floor((companionXPProgress / companionXPTotal) * companionBarLength);
+                    const companionBar = '█'.repeat(companionFill) + '░'.repeat(companionBarLength - companionFill);
+                    
+                    return `${user.name} - Level ${this.getLevel(user.anonymizedId) + 1} (${this.getUserState(user.anonymizedId).experience}/${this.levelThresholds[this.getLevel(user.anonymizedId)]})\n` +
+                    `Journey Lv${companionLevel + 1} [${companionBar}] ${companionXPProgress}/${companionXPTotal}\n` +
+                    `${Object.keys(Stat).map(key => `${key}: ${this.getUserState(user.anonymizedId).stats[key as Stat]}`).join(' | ')}`;
+                }).join('\n') +
                 '```',
             chatState: null
         };
@@ -277,6 +329,7 @@ export class Stage extends StageBase<InitStateType, ChatStateType, MessageStateT
                 userState.lastOutcome = lastOutcome ? this.convertOutcome(lastOutcome) : null;
                 userState.lastOutcomePrompt = messageState[user.anonymizedId]?.['lastOutcomePrompt'] ?? messageState['lastOutcomePrompt'] ?? '';
                 userState.experience = messageState[user.anonymizedId]?.['experience'] ?? messageState['experience'] ?? 0;
+                userState.companionExperience = messageState[user.anonymizedId]?.['companion_experience'] ?? messageState['companion_experience'] ?? 0;
             }
             this.userState[user.anonymizedId] = userState;
         }
@@ -301,6 +354,7 @@ export class Stage extends StageBase<InitStateType, ChatStateType, MessageStateT
             userState['lastOutcome'] = this.getUserState(user.anonymizedId).lastOutcome ?? null;
             userState['lastOutcomePrompt'] = this.getUserState(user.anonymizedId).lastOutcomePrompt ?? '';
             userState['experience'] = this.getUserState(user.anonymizedId).experience ?? 0;
+            userState['companion_experience'] = this.getUserState(user.anonymizedId).companionExperience ?? 0;
 
             messageState[user.anonymizedId] = userState;
         }
